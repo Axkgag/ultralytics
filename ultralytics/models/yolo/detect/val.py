@@ -12,11 +12,26 @@ import torch.distributed as dist
 
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import get_split_fraction
+from ultralytics.engine.results import ElevatorAttributes
 from ultralytics.engine.validator import BaseValidator
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, nms, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
+
+
+class ElevatorDetMetrics(DetMetrics):
+    """Detection metrics container that also exposes elevator attribute metrics."""
+
+    def __init__(self) -> None:
+        """Initialize detection metrics and an empty attribute result dictionary."""
+        super().__init__()
+        self.elevator_results = {}
+
+    @property
+    def results_dict(self) -> dict[str, float]:
+        """Return detection and elevator attribute metrics."""
+        return {**super().results_dict, **self.elevator_results}
 
 
 class DetectionValidator(BaseValidator):
@@ -60,7 +75,8 @@ class DetectionValidator(BaseValidator):
         self.args.task = "detect"
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
-        self.metrics = DetMetrics()
+        self.metrics = ElevatorDetMetrics()
+        self.elevator_stats = None
 
     @staticmethod
     def _check_max_det(args, datasets: dict[str, torch.utils.data.Dataset]) -> None:
@@ -141,9 +157,26 @@ class DetectionValidator(BaseValidator):
         self.build_gdict = self.is_custom_json and self.gdict is None
         self.eval_ids = list(self.dataloader.sampler) if self.is_custom_json else None
         self.pred_counts = []
+        self.elevator_stats = (
+            {
+                key: []
+                for key in (
+                    "slot1_correct",
+                    "slot2_correct",
+                    "floor_correct",
+                    "floor_group",
+                    "light_probability",
+                    "light_target",
+                    "light_unknown",
+                )
+            }
+            if self.data.get("elevator", False)
+            else None
+        )
         if self.build_gdict:
             self.gdict = {"images": [], "annotations": [], "categories": [{"id": x} for x in self.class_map]}
         self.metrics.names = model.names
+        self.metrics.elevator_results = {}
         self.metrics.clear_stats()
         self.metrics.clear_image_metrics()
         self.confusion_matrix = ConfusionMatrix(names=model.names, save_matches=self.args.plots and self.args.visualize)
@@ -166,9 +199,9 @@ class DetectionValidator(BaseValidator):
             preds,
             self.args.conf,
             self.args.iou,
-            nc=0 if self.args.task == "detect" else self.nc,
+            nc=self.nc,
             multi_label=True,
-            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            agnostic=self.args.single_cls or self.args.agnostic_nms or self.data.get("elevator", False),
             max_det=self.args.max_det,
             end2end=self.end2end,
             rotated=self.args.task == "obb",
@@ -196,6 +229,7 @@ class DetectionValidator(BaseValidator):
         return {
             "cls": cls,
             "bboxes": bbox,
+            "elevator": batch["elevator"][idx] if "elevator" in batch else torch.empty(0, 4, device=self.device),
             "ori_shape": ori_shape,
             "imgsz": imgsz,
             "ratio_pad": ratio_pad,
@@ -244,6 +278,8 @@ class DetectionValidator(BaseValidator):
                     for i, (b, c) in enumerate(zip(boxes, cls))
                 )
             predn = self._prepare_pred(pred)
+            if self.data.get("elevator", False):
+                self._update_elevator_metrics(predn, pbatch)
             if self.is_custom_json:
                 self.pred_counts.append(len(predn["cls"]))
 
@@ -326,11 +362,20 @@ class DetectionValidator(BaseValidator):
                     self.gdict[key] = [x for _, gdict, _ in gathered_json for x in gdict[key]]
             self.metrics.stats = merged_stats
             self._gather_image_metrics(self.metrics.box)
+            if self.elevator_stats is not None:
+                gathered_elevator_stats = [None] * dist.get_world_size()
+                dist.gather_object(self.elevator_stats, gathered_elevator_stats, dst=0)
+                self.elevator_stats = {
+                    key: [value for rank_stats in gathered_elevator_stats for value in rank_stats[key]]
+                    for key in self.elevator_stats
+                }
             self.seen = len(self.dataloader.dataset)  # total image count from dataset
         elif RANK > 0:
             dist.gather_object(self.metrics.stats, None, dst=0)
             dist.gather_object((self.jdict, self.gdict if self.build_gdict else None, self.pred_counts), None, dst=0)
             self._gather_image_metrics(self.metrics.box)
+            if self.elevator_stats is not None:
+                dist.gather_object(self.elevator_stats, None, dst=0)
             self.jdict = []
             self.metrics.clear_stats()
         if self.args.plots and RANK > -1:
@@ -346,6 +391,8 @@ class DetectionValidator(BaseValidator):
             (dict[str, Any]): Dictionary containing metrics results.
         """
         self.metrics.process(save_dir=self.save_dir, plot=self.args.plots, on_plot=self.on_plot)
+        if self.data.get("elevator", False):
+            self.metrics.elevator_results = self._elevator_results()
         stats = self.metrics.results_dict
         if self.args.save_json and self.args.task == "detect":
             stats.update({f"metrics/mAP_{x}(B)": 0.0 for x in ("small", "medium", "large")})
@@ -353,6 +400,93 @@ class DetectionValidator(BaseValidator):
                 stats = self.eval_json(stats)
         self.metrics.clear_stats()
         return stats
+
+    def _update_elevator_metrics(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> None:
+        """Accumulate attributes from one-to-one same-class matches with IoU at least 0.5."""
+        if not len(preds["cls"]) or not len(batch["cls"]):
+            return
+        iou = box_iou(batch["bboxes"], preds["bboxes"])
+        candidates = torch.nonzero((iou >= 0.5) & (batch["cls"][:, None] == preds["cls"]), as_tuple=False)
+        if not len(candidates):
+            return
+        candidates = torch.cat((candidates, iou[candidates[:, 0], candidates[:, 1], None]), 1).cpu().numpy()
+        candidates = candidates[candidates[:, 2].argsort()[::-1]]
+        candidates = candidates[np.unique(candidates[:, 1], return_index=True)[1]]
+        candidates = candidates[candidates[:, 2].argsort()[::-1]]
+        candidates = candidates[np.unique(candidates[:, 0], return_index=True)[1]]
+
+        attributes = ElevatorAttributes(preds["extra"], batch["ori_shape"])
+        floor_lookup = {(s1, s2): floor for floor, s1, s2 in attributes.floor_encodings}
+        pred_slot1 = attributes.slot1_probs.argmax(1)
+        pred_slot2 = attributes.slot2_probs.argmax(1)
+        for gt_idx, pred_idx in candidates[:, :2].astype(int):
+            target = batch["elevator"][gt_idx]
+            if int(batch["cls"][gt_idx]) == 0:
+                target_floor = floor_lookup[(int(target[0]), int(target[1]))]
+                self.elevator_stats["slot1_correct"].append(int(pred_slot1[pred_idx]) == int(target[0]))
+                self.elevator_stats["slot2_correct"].append(int(pred_slot2[pred_idx]) == int(target[1]))
+                self.elevator_stats["floor_correct"].append(attributes.floor[pred_idx] == target_floor)
+                self.elevator_stats["floor_group"].append(
+                    "negative" if target_floor.startswith("-") else "ground" if target_floor == "G" else "numeric"
+                )
+            if int(target[3]) == 1:
+                probability = float(attributes.light_probability[pred_idx])
+                self.elevator_stats["light_probability"].append(probability)
+                self.elevator_stats["light_target"].append(int(target[2]))
+                self.elevator_stats["light_unknown"].append(0.3 < probability < 0.7)
+
+    @staticmethod
+    def _binary_auc(scores: np.ndarray, targets: np.ndarray) -> float:
+        """Calculate ROC-AUC from average ranks, including ties."""
+        positives, negatives = targets.sum(), len(targets) - targets.sum()
+        if not positives or not negatives:
+            return 0.0
+        order = np.argsort(scores)
+        sorted_scores = scores[order]
+        ranks = np.empty(len(scores), dtype=float)
+        start = 0
+        while start < len(scores):
+            end = start + 1
+            while end < len(scores) and sorted_scores[end] == sorted_scores[start]:
+                end += 1
+            ranks[order[start:end]] = (start + end + 1) / 2
+            start = end
+        return float((ranks[targets.astype(bool)].sum() - positives * (positives + 1) / 2) / (positives * negatives))
+
+    def _elevator_results(self) -> dict[str, float]:
+        """Summarize floor and light attribute metrics."""
+        values = self.elevator_stats
+        floor_correct = np.asarray(values["floor_correct"], dtype=bool)
+        groups = np.asarray(values["floor_group"])
+        result = {
+            "metrics/slot1_accuracy": float(np.mean(values["slot1_correct"])) if values["slot1_correct"] else 0.0,
+            "metrics/slot2_accuracy": float(np.mean(values["slot2_correct"])) if values["slot2_correct"] else 0.0,
+            "metrics/floor_exact_accuracy": float(floor_correct.mean()) if len(floor_correct) else 0.0,
+            "metrics/target_bbox_success": float(floor_correct.mean()) if len(floor_correct) else 0.0,
+        }
+        for group in ("negative", "ground", "numeric"):
+            selected = groups == group
+            result[f"metrics/{group}_floor_accuracy"] = float(floor_correct[selected].mean()) if selected.any() else 0.0
+
+        probabilities = np.asarray(values["light_probability"])
+        targets = np.asarray(values["light_target"], dtype=int)
+        predicted = probabilities >= 0.5
+        tp = int(((predicted == 1) & (targets == 1)).sum())
+        fp = int(((predicted == 1) & (targets == 0)).sum())
+        fn = int(((predicted == 0) & (targets == 1)).sum())
+        result.update(
+            {
+                "metrics/light_accuracy": float((predicted == targets).mean()) if len(targets) else 0.0,
+                "metrics/light_precision": tp / (tp + fp) if tp + fp else 0.0,
+                "metrics/light_recall": tp / (tp + fn) if tp + fn else 0.0,
+                "metrics/light_f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0,
+                "metrics/light_roc_auc": self._binary_auc(probabilities, targets),
+                "metrics/light_unknown_ratio": float(np.mean(values["light_unknown"]))
+                if values["light_unknown"]
+                else 0.0,
+            }
+        )
+        return result
 
     def print_results(self) -> None:
         """Print training/validation set metrics per class."""

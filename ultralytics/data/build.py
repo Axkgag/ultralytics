@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, dataloader, distributed
 from ultralytics.cfg import IterableSimpleNamespace
 from ultralytics.data.dataset import (
     DepthDataset,
+    ElevatorDataset,
     GroundingDataset,
     PolygonSemanticDataset,
     SemanticDataset,
@@ -258,6 +259,8 @@ def build_yolo_dataset(
         else:
             dataset = PolygonSemanticDataset
         pad = 0.0  # no pad for semantic
+    elif data.get("elevator"):
+        dataset = ElevatorDataset
     elif multi_modal:
         dataset = YOLOMultiModalDataset
     else:

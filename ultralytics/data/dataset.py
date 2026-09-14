@@ -23,6 +23,7 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_18
 from .augment import (
     Compose,
     DepthFormat,
+    ElevatorFormat,
     Format,
     LetterBox,
     RandomLoadText,
@@ -433,6 +434,78 @@ class YOLODataset(BaseDataset):
             for i in range(len(new_batch["batch_idx"])):
                 new_batch["batch_idx"][i] += i  # add target image index for build_targets()
             new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch
+
+
+class ElevatorDataset(YOLODataset):
+    """Dataset for elevator button detection with floor characters and light-state attributes."""
+
+    format_class = ElevatorFormat
+
+    def get_cache_hash(self) -> str:
+        """Return a format-specific cache hash to avoid loading standard five-column labels."""
+        return get_hash(self.label_files + self.im_files + ["elevator-labels-v1"])
+
+    def verify_args(self) -> tuple:
+        """Return image-label verification arguments for the nine-column elevator format."""
+        return verify_image_label, zip(
+            self.im_files,
+            self.label_files,
+            repeat(self.prefix),
+            repeat(False),
+            repeat(len(self.data["names"])),
+            repeat(0),
+            repeat(0),
+            repeat(self.single_cls),
+            repeat(True),
+        )
+
+    def result_to_label(self, result: list) -> tuple[dict | None, int, int, int, int, str]:
+        """Convert a verified elevator row into the composite class representation used by augmentations."""
+        im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg = result
+        label = (
+            {
+                "im_file": im_file,
+                "shape": shape,
+                "cls": lb[:, 0:1],
+                "elevator": lb[:, 5:9],
+                "bboxes": lb[:, 1:5],
+                "segments": segments,
+                "keypoints": keypoint,
+                "normalized": True,
+                "bbox_format": "xywh",
+            }
+            if im_file
+            else None
+        )
+        return label, nm_f, nf_f, ne_f, nc_f, msg
+
+    def update_labels(self, include_class: list[int] | None) -> None:
+        """Filter detection classes and their aligned elevator attributes."""
+        include_class_array = np.array(include_class).reshape(1, -1)
+        for label in self.labels:
+            if include_class is not None:
+                selected = (label["cls"] == include_class_array).any(1)
+                label["cls"] = label["cls"][selected]
+                label["elevator"] = label["elevator"][selected]
+                label["bboxes"] = label["bboxes"][selected]
+                if label["segments"]:
+                    label["segments"] = [segment for segment, keep in zip(label["segments"], selected) if keep]
+                if label.get("keypoints") is not None:
+                    label["keypoints"] = label["keypoints"][selected]
+            if self.single_cls:
+                label["cls"][:] = 0
+
+    def update_labels_info(self, label: dict) -> dict:
+        """Combine attributes with classes only while instance augmentations need aligned row operations."""
+        label["cls"] = np.concatenate((label["cls"], label.pop("elevator")), axis=1)
+        return super().update_labels_info(label)
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Collate images, boxes, and aligned elevator attributes into a training batch."""
+        new_batch = YOLODataset.collate_fn(batch)
+        new_batch["elevator"] = torch.cat(new_batch["elevator"], 0)
         return new_batch
 
 

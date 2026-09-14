@@ -24,6 +24,7 @@ __all__ = (
     "Classify",
     "Depth",
     "Detect",
+    "ElevatorDetect",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -275,6 +276,63 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class ElevatorDetect(Detect):
+    """Four-level detection head for elevator button, floor-character, and light-state prediction."""
+
+    ns1 = 5
+    ns2 = 11
+
+    def __init__(self, nc: int = 2, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize detection and auxiliary heads for two floor-character slots and one light logit."""
+        if nc != 2:
+            raise ValueError(f"ElevatorDetect requires nc=2 (floor and other), got {nc}")
+        if end2end:
+            raise ValueError("ElevatorDetect does not support end-to-end mode")
+        if len(ch) != 4:
+            raise ValueError(f"ElevatorDetect requires four feature levels (P2-P5), got {len(ch)}")
+        super().__init__(nc, reg_max, end2end, ch)
+        c4 = max(ch[0] // 4, 16)
+        self.floor_stem = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3)) for x in ch)
+        self.slot1_head = nn.ModuleList(nn.Conv2d(c4, self.ns1, 1) for _ in ch)
+        self.slot2_head = nn.ModuleList(nn.Conv2d(c4, self.ns2, 1) for _ in ch)
+        self.light_local = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3)) for x in ch)
+        self.light_context = nn.ModuleList(
+            nn.Sequential(nn.AvgPool2d(15, stride=1, padding=7), Conv(x, c4, 1)) for x in ch
+        )
+        self.light_head = nn.ModuleList(
+            nn.Sequential(Conv(c4 * 3, c4, 1), Conv(c4, c4, 3), nn.Conv2d(c4, 1, 1)) for _ in ch
+        )
+
+    def forward_head(
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+    ) -> dict[str, torch.Tensor]:
+        """Return aligned P2-P5 detection, character-slot, and light predictions."""
+        preds = super().forward_head(x, box_head, cls_head)
+        if not preds:
+            return preds
+        bs = x[0].shape[0]
+        floor_features = [self.floor_stem[i](x[i]) for i in range(self.nl)]
+        preds["slot1"] = torch.cat(
+            [self.slot1_head[i](floor_features[i]).view(bs, self.ns1, -1) for i in range(self.nl)], dim=-1
+        )
+        preds["slot2"] = torch.cat(
+            [self.slot2_head[i](floor_features[i]).view(bs, self.ns2, -1) for i in range(self.nl)], dim=-1
+        )
+        light_logits = []
+        for i in range(self.nl):
+            local = self.light_local[i](x[i])
+            context = self.light_context[i](x[i])
+            light_logits.append(self.light_head[i](torch.cat((local, context, local - context), 1)).view(bs, 1, -1))
+        preds["light"] = torch.cat(light_logits, dim=-1)
+        return preds
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes and append slot probabilities and light probability in aligned anchor order."""
+        return torch.cat(
+            (super()._inference(x), x["slot1"].softmax(1), x["slot2"].softmax(1), x["light"].sigmoid()), 1
+        )
 
 
 class Segment(Detect):

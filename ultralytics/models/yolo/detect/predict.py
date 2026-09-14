@@ -51,14 +51,17 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
+        inference = preds[0] if isinstance(preds, (list, tuple)) else preds
+        elevator = inference.ndim == 3 and inference.shape[1] == 23 and len(self.model.names) == 2
+        self._elevator_prediction = elevator
         preds = nms.non_max_suppression(
             preds,
             self.args.conf,
             kwargs.pop("iou", self.args.iou),  # allow callers (e.g. TrackTrack loose-NMS recovery) to override IoU
             self.args.classes,
-            self.args.agnostic_nms,
+            self.args.agnostic_nms or elevator,
             max_det=self.args.max_det,
-            nc=0 if self.args.task == "detect" else len(self.model.names),
+            nc=len(self.model.names),
             end2end=getattr(self.model, "end2end", False),
             rotated=self.args.task == "obb",
             return_idxs=save_feats,
@@ -119,4 +122,5 @@ class DetectionPredictor(BasePredictor):
             (Results): Results object containing the original image, image path, class names, and scaled bounding boxes.
         """
         pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
-        return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+        elevator = pred[:, 6:] if getattr(self, "_elevator_prediction", False) else None
+        return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], elevator=elevator)

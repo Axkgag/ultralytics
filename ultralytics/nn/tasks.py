@@ -48,6 +48,7 @@ from ultralytics.nn.modules import (
     ConvTranspose,
     Depth,
     Detect,
+    ElevatorDetect,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -96,6 +97,7 @@ from ultralytics.utils.loss import (
     SemanticSegmentationLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
+    v8ElevatorDetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -594,6 +596,8 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        if isinstance(self.model[-1], ElevatorDetect):
+            return v8ElevatorDetectionLoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
@@ -2112,6 +2116,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                ElevatorDetect,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -2127,7 +2132,19 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                ElevatorDetect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is Depth:
             args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store

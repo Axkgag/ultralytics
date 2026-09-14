@@ -2253,7 +2253,7 @@ class Albumentations(BaseTransform):
                         keypoints[..., 1] /= h
                     instances.update(np.array(new["bboxes"], dtype=np.float32).reshape(-1, 4), keypoints=keypoints)
                 labels["img"] = new["image"]
-                labels["cls"] = cls[i].reshape(-1, 1)
+                labels["cls"] = cls[i].reshape(-1, cls.shape[1])
                 labels["instances"] = instances
                 if mask is not None:
                     labels[key] = new["mask"]
@@ -2495,6 +2495,18 @@ class Format(BaseTransform):
             masks = polygons2masks((h, w), segments, color=1, downsample_ratio=self.mask_ratio)
 
         return masks, instances, cls
+
+
+class ElevatorFormat(Format):
+    """Format elevator button labels while preserving their four auxiliary attributes."""
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Split composite class labels into detection classes and elevator attributes."""
+        cls = params.get("cls", np.empty((0, 5), dtype=np.float32))
+        params["cls"] = cls[:, :1]
+        labels = super().apply_instances(labels, params)
+        labels["elevator"] = torch.from_numpy(cls[:, 1:5]) if len(cls) else torch.zeros((0, 4))
+        return labels
 
 
 class SemanticFormat(Format):

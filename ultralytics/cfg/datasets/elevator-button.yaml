@@ -1,0 +1,13 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Elevator button dataset using 9-column labels:
+# button_cls cx cy width height slot1 slot2 light light_valid
+path: elevator-button
+train: images/train
+val: images/val
+test: images/test
+
+elevator: true
+names:
+  0: floor
+  1: other

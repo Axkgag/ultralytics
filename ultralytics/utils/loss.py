@@ -489,6 +489,67 @@ class v8DetectionLoss:
         return loss * batch_size, loss_detach
 
 
+class v8ElevatorDetectionLoss(v8DetectionLoss):
+    """Detection loss with masked floor-character and light-state supervision for elevator buttons."""
+
+    def __init__(self, model: torch.nn.Module, tal_topk: int = 10, tal_topk2: int | None = None):
+        """Initialize the elevator multi-task criterion."""
+        super().__init__(model, tal_topk, tal_topk2)
+        self.loss_names = (*self.loss_names, "slot1_loss", "slot2_loss", "light_loss")
+        self.attribute_gains = torch.tensor(
+            [model.yaml.get("slot1_gain", 1.0), model.yaml.get("slot2_gain", 1.0), model.yaml.get("light_gain", 1.0)],
+            device=self.device,
+        )
+
+    def _extra_targets(self, batch: dict[str, torch.Tensor], batch_size: int) -> torch.Tensor:
+        """Pad per-instance class and elevator attributes using the detector target ordering."""
+        batch_idx = batch["batch_idx"].long().to(self.device)
+        targets = torch.cat((batch["cls"], batch["elevator"]), 1).to(self.device)
+        if not len(targets):
+            return torch.zeros(batch_size, 0, 5, device=self.device)
+        _, counts = batch_idx.unique(return_counts=True)
+        out = torch.zeros(batch_size, counts.max(), 5, device=self.device, dtype=targets.dtype)
+        offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+        offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
+        offsets = offsets.cumsum(0)
+        out[batch_idx, torch.arange(len(targets), device=self.device) - offsets[batch_idx]] = targets
+        return out
+
+    def loss(
+        self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Calculate detection and auxiliary losses on their valid positive assignments."""
+        batch_size = preds["boxes"].shape[0]
+        assignment, detection_loss, _ = self.get_assigned_targets_and_loss(preds, batch)
+        fg_mask, target_gt_idx = assignment[:2]
+        auxiliary_loss = torch.zeros(3, device=self.device)
+        pred_slot1 = preds["slot1"].permute(0, 2, 1).contiguous()
+        pred_slot2 = preds["slot2"].permute(0, 2, 1).contiguous()
+        pred_light = preds["light"].squeeze(1)
+
+        if fg_mask.any():
+            targets = self._extra_targets(batch, batch_size)
+            assigned = targets.gather(1, target_gt_idx[..., None].expand(-1, -1, targets.shape[-1]))
+            floor_mask = fg_mask & (assigned[..., 0] == 0)
+            light_mask = fg_mask & (assigned[..., 4] == 1)
+            if floor_mask.any():
+                auxiliary_loss[0] = F.cross_entropy(pred_slot1[floor_mask], assigned[..., 1][floor_mask].long())
+                auxiliary_loss[1] = F.cross_entropy(pred_slot2[floor_mask], assigned[..., 2][floor_mask].long())
+            else:
+                auxiliary_loss[:2] += (pred_slot1.sum() + pred_slot2.sum()) * 0
+            if light_mask.any():
+                auxiliary_loss[2] = F.binary_cross_entropy_with_logits(
+                    pred_light[light_mask], assigned[..., 3][light_mask].to(pred_light.dtype)
+                )
+            else:
+                auxiliary_loss[2] += pred_light.sum() * 0
+        else:
+            auxiliary_loss += (pred_slot1.sum() + pred_slot2.sum() + pred_light.sum()) * 0
+
+        loss = torch.cat((detection_loss, auxiliary_loss * self.attribute_gains))
+        return loss * batch_size, dict(zip(self.loss_names, loss.detach()))
+
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 

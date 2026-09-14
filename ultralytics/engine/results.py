@@ -256,6 +256,7 @@ class Results(SimpleClass, DataExportMixin):
         speed: dict[str, float] | None = None,
         semantic_mask: torch.Tensor | None = None,
         depth: torch.Tensor | None = None,
+        elevator: torch.Tensor | None = None,
     ) -> None:
         """Initialize the Results class for storing and manipulating inference results.
 
@@ -270,6 +271,7 @@ class Results(SimpleClass, DataExportMixin):
             obb (torch.Tensor | None): A 2D tensor of oriented bounding box coordinates for each detection.
             semantic_mask (torch.Tensor | None): A 2D tensor of class IDs for semantic segmentation results.
             depth (torch.Tensor | None): A 2D float tensor of per-pixel depth values (H, W).
+            elevator (torch.Tensor | None): A 2D tensor with 17 floor-character and light probability values per box.
             speed (dict | None): A dictionary containing preprocess, inference, and postprocess speeds (ms/image).
 
         Notes:
@@ -288,11 +290,12 @@ class Results(SimpleClass, DataExportMixin):
         self.obb = OBB(obb, self.orig_shape) if obb is not None else None
         self.semantic_mask = SemanticMask(semantic_mask, self.orig_shape) if semantic_mask is not None else None
         self.depth = DepthMap(depth, self.orig_shape) if depth is not None else None
+        self.elevator = ElevatorAttributes(elevator, self.orig_shape) if elevator is not None else None
         self.speed = speed if speed is not None else {"preprocess": None, "inference": None, "postprocess": None}
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "semantic_mask", "depth"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "semantic_mask", "depth", "elevator"
 
     def __getitem__(self, idx):
         """Return a Results object for a specific index of inference results.
@@ -337,6 +340,7 @@ class Results(SimpleClass, DataExportMixin):
         keypoints: torch.Tensor | None = None,
         semantic_mask: torch.Tensor | None = None,
         depth: torch.Tensor | None = None,
+        elevator: torch.Tensor | None = None,
     ):
         """Update the Results object with new detection data.
 
@@ -353,6 +357,7 @@ class Results(SimpleClass, DataExportMixin):
             semantic_mask (torch.Tensor | None): A tensor of shape (H, W) containing class IDs for semantic
                 segmentation.
             depth (torch.Tensor | None): A tensor of shape (H, W) containing per-pixel depth values.
+            elevator (torch.Tensor | None): A tensor with 17 floor-character and light probability values per box.
 
         Examples:
             >>> results = model("image.jpg")
@@ -373,6 +378,8 @@ class Results(SimpleClass, DataExportMixin):
             self.semantic_mask = SemanticMask(semantic_mask, self.orig_shape)
         if depth is not None:
             self.depth = DepthMap(depth, self.orig_shape)
+        if elevator is not None:
+            self.elevator = ElevatorAttributes(elevator, self.orig_shape)
 
     def _apply(self, fn: str, *args, **kwargs):
         """Apply a function to all non-empty attributes and return a new Results object with modified attributes.
@@ -539,6 +546,7 @@ class Results(SimpleClass, DataExportMixin):
         pred_boxes, show_boxes = self.obb if is_obb else self.boxes, boxes
         pred_masks, show_masks = self.masks, masks
         pred_probs, show_probs = self.probs, probs
+        elevator = self.elevator.cpu() if self.elevator is not None else None
         if pred_boxes is not None and (show_boxes or (pred_masks and show_masks)):
             pred_boxes = pred_boxes.cpu()  # one host transfer avoids per-box GPU syncs in the color and label loops
         annotator = Annotator(
@@ -568,6 +576,10 @@ class Results(SimpleClass, DataExportMixin):
                 c = int(d.cls.item())  # .item() works for torch and numpy alike; int()/float() need 0-d since numpy 2.4
                 d_conf, id = float(d.conf.item()) if conf else None, int(d.id.item()) if d.is_track else None
                 name = ("" if id is None else f"id:{id} ") + names[c]
+                if elevator is not None:
+                    j = len(pred_boxes) - 1 - i
+                    floor = f" {elevator.floor[j]}" if c == 0 else ""
+                    name += f"{floor} {elevator.light_state[j]}:{float(elevator.light_probability[j]):.2f}"
                 label = (f"{name} {d_conf:.2f}" if conf else name) if labels else (f"{d_conf:.2f}" if conf else None)
                 box = d.xyxyxyxy.squeeze() if is_obb else d.xyxy.squeeze()
                 annotator.box_label(
@@ -893,6 +905,7 @@ class Results(SimpleClass, DataExportMixin):
         kpts = self.keypoints
         if kpts is not None:
             kpts = kpts.cpu()  # ditto for the per-row keypoints sync below
+        elevator = self.elevator.cpu() if self.elevator is not None else None
         h, w = self.orig_shape if normalize else (1, 1)
         for i, row in enumerate(data):  # xyxy, track_id if tracking, conf, class_id
             class_id, conf = int(row.cls.item()), round(row.conf.item(), decimals)
@@ -902,6 +915,20 @@ class Results(SimpleClass, DataExportMixin):
                 xy[f"x{j + 1}"] = round(b[0] / w, decimals)
                 xy[f"y{j + 1}"] = round(b[1] / h, decimals)
             result = {"name": self.names[class_id], "class": class_id, "confidence": conf, "box": xy}
+            if elevator is not None:
+                result.update(
+                    {
+                        "floor": elevator.floor[i] if class_id == 0 else None,
+                        "floor_confidence": round(float(elevator.floor_confidence[i]), decimals)
+                        if class_id == 0
+                        else None,
+                        "floor_score": round(conf * float(elevator.floor_confidence[i]), decimals)
+                        if class_id == 0
+                        else None,
+                        "light_probability": round(float(elevator.light_probability[i]), decimals),
+                        "light_state": elevator.light_state[i],
+                    }
+                )
             if data.is_track:
                 result["track_id"] = int(row.id.item())  # track ID
             if self.masks:
@@ -922,6 +949,71 @@ class Results(SimpleClass, DataExportMixin):
             results.append(result)
 
         return results
+
+
+class ElevatorAttributes(BaseTensor):
+    """Per-detection floor-character probabilities and light-state probability."""
+
+    floor_encodings = (
+        ("-2", 1, 3),
+        ("-1", 1, 2),
+        ("G", 2, 0),
+        *((str(floor), 0, floor + 1) for floor in range(1, 10)),
+        *((str(floor), 3, floor - 9) for floor in range(10, 20)),
+        ("20", 4, 1),
+        ("21", 4, 2),
+    )
+
+    def __init__(self, data: torch.Tensor | np.ndarray, orig_shape: tuple[int, int]) -> None:
+        """Initialize attributes from 5 Slot-1, 11 Slot-2, and 1 light probability channels."""
+        if data.ndim == 1:
+            data = data[None, :]
+        if data.shape[-1] != 17:
+            raise ValueError(f"ElevatorAttributes expects 17 values per detection, got {data.shape[-1]}")
+        super().__init__(data, orig_shape)
+
+    @property
+    def slot1_probs(self) -> torch.Tensor | np.ndarray:
+        """Return Slot-1 probabilities in [blank, '-', 'G', '1', '2'] order."""
+        return self.data[:, :5]
+
+    @property
+    def slot2_probs(self) -> torch.Tensor | np.ndarray:
+        """Return Slot-2 probabilities in [blank, '0', ..., '9'] order."""
+        return self.data[:, 5:16]
+
+    @property
+    def light_probability(self) -> torch.Tensor | np.ndarray:
+        """Return button light probabilities."""
+        return self.data[:, 16]
+
+    @cached_property
+    def floor_scores(self) -> torch.Tensor | np.ndarray:
+        """Return geometric-mean character scores for every legal floor."""
+        if isinstance(self.data, torch.Tensor):
+            return torch.stack(
+                [(self.slot1_probs[:, s1] * self.slot2_probs[:, s2]).sqrt() for _, s1, s2 in self.floor_encodings], 1
+            )
+        return np.stack(
+            [np.sqrt(self.slot1_probs[:, s1] * self.slot2_probs[:, s2]) for _, s1, s2 in self.floor_encodings], 1
+        )
+
+    @property
+    def floor(self) -> list[str]:
+        """Return the highest-scoring legal floor for each detection."""
+        indices = self.floor_scores.argmax(1).tolist()
+        return [self.floor_encodings[i][0] for i in indices]
+
+    @property
+    def floor_confidence(self) -> torch.Tensor | np.ndarray:
+        """Return the character score of the selected legal floor."""
+        return self.floor_scores.max(1).values if isinstance(self.data, torch.Tensor) else self.floor_scores.max(1)
+
+    @property
+    def light_state(self) -> list[str]:
+        """Return on, off, or unknown using the 0.70/0.30 decision thresholds."""
+        probabilities = self.light_probability.tolist()
+        return ["on" if p >= 0.7 else "off" if p <= 0.3 else "unknown" for p in probabilities]
 
 
 class Boxes(BaseTensor):
