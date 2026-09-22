@@ -10,7 +10,7 @@ from ultralytics import YOLO
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA = Path("/mnt/yihao/codes/buttonDet/datasets_qwen_lit_yolo/elevator-button.yaml")
+DEFAULT_DATA = Path("/mnt/yihao/codes/buttonDet/ultralytics/scripts/elevator-button.yaml")
 DEFAULT_WEIGHTS = Path("/mnt/yihao/codes/buttonDet/ultralytics/weights/yolov8l.pt")
 
 

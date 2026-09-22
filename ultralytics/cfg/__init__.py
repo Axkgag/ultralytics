@@ -244,6 +244,7 @@ CFG_FRACTION_KEYS = frozenset(
         "erasing",
         "conf",
         "iou",
+        "light_threshold",
         "fraction",
         "multi_scale",
         "dlam",

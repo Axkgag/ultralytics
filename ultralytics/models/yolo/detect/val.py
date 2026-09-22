@@ -470,7 +470,7 @@ class DetectionValidator(BaseValidator):
 
         probabilities = np.asarray(values["light_probability"])
         targets = np.asarray(values["light_target"], dtype=int)
-        predicted = probabilities >= 0.5
+        predicted = probabilities >= self.args.light_threshold
         tp = int(((predicted == 1) & (targets == 1)).sum())
         fp = int(((predicted == 1) & (targets == 0)).sum())
         fn = int(((predicted == 0) & (targets == 1)).sum())

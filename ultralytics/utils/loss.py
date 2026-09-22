@@ -500,6 +500,9 @@ class v8ElevatorDetectionLoss(v8DetectionLoss):
             [model.yaml.get("slot1_gain", 1.0), model.yaml.get("slot2_gain", 1.0), model.yaml.get("light_gain", 1.0)],
             device=self.device,
         )
+        self.light_asl_gamma_pos = float(model.yaml.get("light_asl_gamma_pos", 0.0))
+        self.light_asl_gamma_neg = float(model.yaml.get("light_asl_gamma_neg", 0.0))
+        self.light_asl_clip = float(model.yaml.get("light_asl_clip", 0.0))
 
     def _extra_targets(self, batch: dict[str, torch.Tensor], batch_size: int) -> torch.Tensor:
         """Pad per-instance class and elevator attributes using the detector target ordering."""
@@ -538,9 +541,21 @@ class v8ElevatorDetectionLoss(v8DetectionLoss):
             else:
                 auxiliary_loss[:2] += (pred_slot1.sum() + pred_slot2.sum()) * 0
             if light_mask.any():
-                auxiliary_loss[2] = F.binary_cross_entropy_with_logits(
-                    pred_light[light_mask], assigned[..., 3][light_mask].to(pred_light.dtype)
+                light_logits = pred_light[light_mask].float()
+                light_targets = assigned[..., 3][light_mask].float()
+                light_prob = light_logits.sigmoid()
+                light_neg_prob = (1.0 - light_prob + self.light_asl_clip).clamp(max=1.0)
+                light_log_prob = light_targets * F.logsigmoid(light_logits) + (1.0 - light_targets) * torch.log(
+                    light_neg_prob.clamp_min(1e-8)
                 )
+                with torch.no_grad():
+                    light_pt = light_prob * light_targets + light_neg_prob * (1.0 - light_targets)
+                    light_gamma = (
+                        self.light_asl_gamma_pos * light_targets
+                        + self.light_asl_gamma_neg * (1.0 - light_targets)
+                    )
+                    light_weight = (1.0 - light_pt).pow(light_gamma)
+                auxiliary_loss[2] = -(light_weight * light_log_prob).mean()
             else:
                 auxiliary_loss[2] += pred_light.sum() * 0
         else:

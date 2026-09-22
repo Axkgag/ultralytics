@@ -54,6 +54,7 @@ split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
 save_json: False # (bool) save COCO JSON (detect/segment/pose), compute detect size metrics, or save semantic PNG masks
 conf: # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
 iou: 0.7 # (float) IoU threshold used for NMS
+light_threshold: 0.5 # (float) probability threshold for elevator light-state metrics
 max_det: 300 # (int) maximum number of detections per image
 quantize: # (int|str, optional) precision: predict/val 16/fp16 or 32/fp32/None sets pt/torchscript compute; elsewhere the artifact/runtime decides, though 16 rounds openvino/triton inputs and returns triton outputs as fp16; export also supports 8/int8 and w8a8|w16a16|w8a16|w8a32; replaces deprecated half/int8 args
 dnn: False # (bool) use OpenCV DNN for ONNX inference
@@ -117,11 +118,11 @@ nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction
 hsv_v: 0.4 # (float) HSV value (brightness) augmentation fraction
-degrees: 0.0 # (float) rotation degrees (+/-)
+degrees: 2.0 # (float) rotation degrees (+/-)
 translate: 0.1 # (float) translation fraction (+/-)
 scale: 0.5 # (float | tuple) scale gain (+/-) as float, or explicit (min, max) tuple
-shear: 0.0 # (float) shear degrees (+/-)
-perspective: 0.0 # (float) perspective fraction (0–0.001 typical)
+shear: 3.0 # (float) shear degrees (+/-)
+perspective: 0.0005 # (float) perspective fraction (0–0.001 typical)
 flipud: 0.0 # (float) vertical flip probability
 fliplr: 0.5 # (float) horizontal flip probability
 bgr: 0.0 # (float) RGB↔BGR channel swap probability
