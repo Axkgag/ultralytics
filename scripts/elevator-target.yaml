@@ -1,0 +1,13 @@
+# Elevator multi-task dataset: class cx cy width height slot1 slot2 light light_valid
+path: /mnt/yihao/codes/buttonDet/datasets
+train: 
+  - u2v1_0929_1020/data/images
+  - u2v2_0929_1020/data/images
+val: 
+  - u2v1_0929_1020/data/images
+  - u2v2_0929_1020/data/images
+
+elevator: true
+names:
+  0: floor
+  1: other

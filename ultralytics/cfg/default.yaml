@@ -41,6 +41,20 @@ multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are r
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
 channels_last: # (bool, optional) auto-enable for CUDA training on PyTorch 1.11+ and supported x86 CPU inference
 
+# Unsupervised domain adaptation (ElevatorDetect only)
+unsup: False # (bool) enable teacher-student unsupervised domain adaptation
+target_data: # (str, optional) target dataset YAML; if unset, split source train images each epoch
+unsup_ratio: 0.25 # (float) target-image fraction of each training batch and internal source split
+unsup_weight: 0.25 # (float) maximum target pseudo-label loss weight
+unsup_warmup_epochs: 5 # (int) source-only epochs before ramping the target loss
+uda_teacher_decay: 0.999 # (float) fixed EMA decay for the UDA teacher
+pseudo_conf: 0.9 # (float) teacher detection confidence threshold
+pseudo_iou: 0.7 # (float) class-agnostic teacher NMS IoU threshold
+pseudo_floor_conf: 0.9 # (float) minimum legal ElevatorDetect floor-combination score
+pseudo_light_conf: 0.9 # (float) minimum light on/off confidence; higher values mask more uncertain light labels
+pseudo_max_boxes: 30 # (int) maximum accepted pseudo boxes per target image
+pseudo_max_floor_ratio: 0.98 # (float) maximum floor-class share before rejecting a pseudo batch
+
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)
 mask_ratio: 4 # (int) mask downsample ratio (segment only)

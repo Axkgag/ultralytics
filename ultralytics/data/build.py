@@ -228,6 +228,54 @@ class ContiguousDistributedSampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
 
+class EpochSplitSampler(torch.utils.data.Sampler):
+    """Select one side of a deterministic per-epoch source/target split and shard it across ranks."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        ratio: float,
+        target: bool,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        seed: int = 0,
+    ) -> None:
+        """Initialize the sampler for the supervised or unsupervised side of each epoch's split."""
+        self.num_replicas = num_replicas or (dist.get_world_size() if dist.is_initialized() else 1)
+        self.rank = dist.get_rank() if rank is None and dist.is_initialized() else (0 if rank is None else rank)
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(f"rank={self.rank} must be in [0, {self.num_replicas})")
+        self.dataset_len = len(dataset)
+        self.target_size = round(self.dataset_len * ratio)
+        if not 0 < self.target_size < self.dataset_len:
+            raise ValueError(
+                f"unsup_ratio={ratio} leaves an empty source or target split for {self.dataset_len} images"
+            )
+        self.target = target
+        self.seed = seed
+        self.epoch = 0
+        split_size = self.target_size if target else self.dataset_len - self.target_size
+        self.num_samples = math.ceil(split_size / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self) -> Iterator:
+        """Return this rank's padded indices from the selected side of the epoch split."""
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(self.dataset_len, generator=generator).tolist()
+        indices = indices[: self.target_size] if self.target else indices[self.target_size :]
+        padding = self.total_size - len(indices)
+        indices += (indices * math.ceil(padding / len(indices)))[:padding]
+        return iter(indices[self.rank : self.total_size : self.num_replicas])
+
+    def __len__(self) -> int:
+        """Return the number of samples assigned to this rank."""
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select the deterministic split for an epoch."""
+        self.epoch = epoch
+
+
 def seed_worker(worker_id: int) -> None:
     """Set dataloader worker seed for reproducibility across worker processes."""
     worker_seed = torch.initial_seed() % 2**32
@@ -329,6 +377,7 @@ def build_dataloader(
     drop_last: bool = False,
     pin_memory: bool = True,
     device: torch.device | str = "cuda",
+    sampler: torch.utils.data.Sampler | None = None,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -341,6 +390,7 @@ def build_dataloader(
         drop_last (bool, optional): Whether to drop the last incomplete batch.
         pin_memory (bool, optional): Whether to use pinned memory for dataloader.
         device (torch.device | str, optional): Device used by the dataloader consumer.
+        sampler (torch.utils.data.Sampler, optional): Explicit sampler overriding shuffle and distributed sampling.
 
     Returns:
         (InfiniteDataLoader): A dataloader that can be used for training or validation.
@@ -353,13 +403,12 @@ def build_dataloader(
     dataset_len = len(dataset)
     batch = min(batch, dataset_len)
     seed = torch.initial_seed() - RANK - 1
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
+    if sampler is None and rank != -1:
+        sampler = (
+            distributed.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
     samples = len(sampler) if sampler is not None else dataset_len
     drop_last = drop_last and bool(batch) and dataset_len % batch != 0
     batches = (samples // batch if drop_last else math.ceil(samples / batch)) if batch else 0

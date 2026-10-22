@@ -1080,8 +1080,11 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 columns = (
                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
                 )
-                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
+                plot_columns = math.ceil(len(columns) / 2)
+                fig, ax = plt.subplots(2, plot_columns, figsize=(len(columns) + 2, 6), tight_layout=True)
                 ax = ax.ravel()
+                for unused_ax in ax[len(columns) :]:
+                    unused_ax.set_visible(False)
             x = data.select(data.columns[0]).to_numpy().flatten()
             for i, j in enumerate(columns):
                 y = data.select(j).to_numpy().flatten().astype("float")

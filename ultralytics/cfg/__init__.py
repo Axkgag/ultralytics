@@ -217,6 +217,7 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "unsup_weight",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -248,6 +249,13 @@ CFG_FRACTION_KEYS = frozenset(
         "fraction",
         "multi_scale",
         "dlam",
+        "unsup_ratio",
+        "uda_teacher_decay",
+        "pseudo_conf",
+        "pseudo_iou",
+        "pseudo_floor_conf",
+        "pseudo_light_conf",
+        "pseudo_max_floor_ratio",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -263,6 +271,8 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "unsup_warmup_epochs",
+        "pseudo_max_boxes",
     }
 )
 CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, sizes or seeds
@@ -271,6 +281,7 @@ CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, 
     "mask_ratio": 1,
     "vid_stride": 1,
     "seed": 0,
+    "pseudo_max_boxes": 1,
 }
 CFG_BOOL_KEYS = frozenset(
     {  # boolean-only arguments
@@ -307,9 +318,10 @@ CFG_BOOL_KEYS = frozenset(
         "channels_last",
         "end2end",
         "cls_remap",
+        "unsup",
     }
 )
-CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment"})
+CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "target_data"})
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:

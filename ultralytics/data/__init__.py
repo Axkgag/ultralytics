@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from .base import BaseDataset
-from .build import build_dataloader, build_grounding, build_yolo_dataset, load_inference_source
+from .build import EpochSplitSampler, build_dataloader, build_grounding, build_yolo_dataset, load_inference_source
 from .dataset import (
     ClassificationDataset,
     GroundingDataset,
@@ -21,6 +21,7 @@ __all__ = (
     "YOLOConcatDataset",
     "YOLODataset",
     "YOLOMultiModalDataset",
+    "EpochSplitSampler",
     "build_dataloader",
     "build_grounding",
     "build_yolo_dataset",

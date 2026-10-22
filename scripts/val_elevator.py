@@ -136,8 +136,10 @@ def draw_prediction(result, light_threshold: float) -> object:
     return annotator.result()
 
 
-def match_failures(result, targets: list[dict], args: argparse.Namespace) -> tuple[dict[str, set[int]], Counter]:
-    """Match predictions to ground truth and return prediction indices for each failure category."""
+def match_failures(
+    result, targets: list[dict], args: argparse.Namespace
+) -> tuple[dict[str, set[int]], set[int], Counter]:
+    """Match predictions to ground truth and return failed prediction and missed target indices."""
     failures = {category: set() for category in ("detection", "floor", "light")}
     counts = Counter()
     boxes = result.boxes.cpu()
@@ -179,10 +181,11 @@ def match_failures(result, targets: list[dict], args: argparse.Namespace) -> tup
             failures["light"].add(prediction_index)
             counts["light_errors"] += 1
 
-    counts["missed_gt"] = len(targets) - len(used_targets)
+    missed_targets = set(range(len(targets))) - used_targets
+    counts["missed_gt"] = len(missed_targets)
     counts["false_positives"] = len(boxes) - len(used_predictions)
     failures["detection"].update(set(range(len(boxes))) - used_predictions)
-    return failures, counts
+    return failures, missed_targets, counts
 
 
 def draw_failure_predictions(
@@ -206,6 +209,39 @@ def draw_failure_predictions(
             color=(0, 0, 255),
         )
     return annotator.result()
+
+
+def draw_missed_targets(image, result, targets: list[dict], target_indices: set[int]) -> object:
+    """Draw missed ground-truth boxes as red dashed rectangles on the prediction panel."""
+    thickness = max(round(sum(image.shape[:2]) / 2 * 0.003), 2)
+    dash_length = max(thickness * 4, 8)
+    height, width = image.shape[:2]
+    for index in sorted(target_indices):
+        target = targets[index]
+        x1, y1, x2, y2 = (round(value) for value in target["box"])
+        x1, x2 = max(x1, 0), min(x2, width - 1)
+        y1, y2 = max(y1, 0), min(y2, height - 1)
+        for x in range(x1, x2, dash_length * 2):
+            cv2.line(image, (x, y1), (min(x + dash_length, x2), y1), (0, 0, 255), thickness)
+            cv2.line(image, (x, y2), (min(x + dash_length, x2), y2), (0, 0, 255), thickness)
+        for y in range(y1, y2, dash_length * 2):
+            cv2.line(image, (x1, y), (x1, min(y + dash_length, y2)), (0, 0, 255), thickness)
+            cv2.line(image, (x2, y), (x2, min(y + dash_length, y2)), (0, 0, 255), thickness)
+
+        class_id = target["class_id"]
+        floor = FLOOR_BY_SLOTS[(target["slot1"], target["slot2"])] if class_id == 0 else result.names[class_id]
+        light = target["light"] if target["light_valid"] else "?"
+        cv2.putText(
+            image,
+            f"MISS {floor}:{light}",
+            (x1, max(y1 - 6, 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            max(thickness / 3, 0.5),
+            (0, 0, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+    return image
 
 
 def add_header(image, title: str) -> object:
@@ -242,7 +278,7 @@ def save_visualizations(model: YOLO, args: argparse.Namespace) -> None:
         output = directory / Path(result.path).name
         if not cv2.imwrite(str(output), comparison):
             raise OSError(f"Failed to save visualization: {output}")
-        failures, counts = match_failures(result, targets, args)
+        failures, missed_targets, counts = match_failures(result, targets, args)
         failure_summary.update(counts)
         failed = False
         for category, prediction_indices in failures.items():
@@ -255,9 +291,10 @@ def save_visualizations(model: YOLO, args: argparse.Namespace) -> None:
             failure_summary[f"{category}_fail_images"] += 1
             category_directory = failure_directory / category
             category_directory.mkdir(parents=True, exist_ok=True)
-            failure_prediction = add_header(
-                draw_failure_predictions(result, prediction_indices, args.light_threshold, category), "PREDICT"
-            )
+            failure_prediction = draw_failure_predictions(result, prediction_indices, args.light_threshold, category)
+            if category == "detection":
+                failure_prediction = draw_missed_targets(failure_prediction, result, targets, missed_targets)
+            failure_prediction = add_header(failure_prediction, "PREDICT")
             failure_output = category_directory / Path(result.path).name
             if not cv2.imwrite(str(failure_output), cv2.hconcat((ground_truth, failure_prediction))):
                 raise OSError(f"Failed to save fail-case visualization: {failure_output}")

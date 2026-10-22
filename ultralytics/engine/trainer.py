@@ -458,8 +458,7 @@ class BaseTrainer:
                 self.scheduler.step()
 
             self._model_train()
-            if RANK != -1:
-                self.train_loader.sampler.set_epoch(epoch)
+            self.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
@@ -497,12 +496,7 @@ class BaseTrainer:
                 try:
                     with autocast(torch.bfloat16 if self.args.amp == "bf16" else self.amp, device=self.device.type):
                         batch = self.preprocess_batch(batch)
-                        if self.args.compile:
-                            # Decouple inference and loss calculations for improved compile performance
-                            preds = self.model(batch["img"])
-                            loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
-                        else:
-                            loss, self.loss_items = self.model(batch)
+                        loss, self.loss_items = self.compute_loss(batch)
                         self.loss = loss.sum()
                         if RANK != -1:
                             self.loss *= self.world_size
@@ -540,7 +534,7 @@ class BaseTrainer:
                         f"{error} with batch={old_batch}. "
                         f"Reducing to batch={self.batch_size} and retrying ({self._oom_retries}/3)."
                     )
-                    batch = loss = preds = None
+                    batch = loss = None
                     self.loss = self.loss_items = self.tloss = None
                     self._clear_memory()
                     self._build_train_pipeline()  # rebuild dataloaders, optimizer, scheduler
@@ -861,6 +855,19 @@ class BaseTrainer:
     def preprocess_batch(self, batch):
         """Allow custom preprocessing of model inputs and ground truths depending on task type."""
         return batch
+
+    def compute_loss(self, batch):
+        """Compute the task loss for a preprocessed training batch."""
+        if self.args.compile:
+            preds = self.model(batch["img"])
+            return unwrap_model(self.model).loss(batch, preds)
+        return self.model(batch)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update epoch-aware training samplers."""
+        sampler = self.train_loader.sampler
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
 
     def validate(self):
         """Run validation on val set using self.validator.
