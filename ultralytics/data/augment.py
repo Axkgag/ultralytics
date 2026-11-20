@@ -2253,7 +2253,7 @@ class Albumentations(BaseTransform):
                         keypoints[..., 1] /= h
                     instances.update(np.array(new["bboxes"], dtype=np.float32).reshape(-1, 4), keypoints=keypoints)
                 labels["img"] = new["image"]
-                labels["cls"] = cls[i].reshape(-1, 1)
+                labels["cls"] = cls[i].reshape(-1, cls.shape[1])
                 labels["instances"] = instances
                 if mask is not None:
                     labels[key] = new["mask"]
@@ -2497,6 +2497,18 @@ class Format(BaseTransform):
         return masks, instances, cls
 
 
+class ElevatorFormat(Format):
+    """Format nine-column elevator labels while preserving their four auxiliary attributes."""
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Split composite class labels into detection classes and elevator attributes."""
+        cls = params.get("cls", np.empty((0, 5), dtype=np.float32))
+        params["cls"] = cls[:, :1]
+        labels = super().apply_instances(labels, params)
+        labels["elevator"] = torch.from_numpy(cls[:, 1:5]) if len(cls) else torch.zeros((0, 4))
+        return labels
+
+
 class SemanticFormat(Format):
     """Format transform for semantic segmentation that converts images and masks to tensors.
 
@@ -2645,6 +2657,90 @@ class LoadVisualPrompt(BaseTransform):
         for idx, mask in zip(inverse_indices, masks):
             visuals[idx] = torch.logical_or(visuals[idx], mask)
         return visuals
+
+
+class VisualPromptCanvas:
+    """Place augmented multi-scale copies of one cropped prompt on a neutral canvas."""
+
+    def __init__(
+        self,
+        shape: tuple[int, int],
+        sizes: tuple[int, ...] = (64, 96, 160),
+        size_jitter: float = 0.2,
+        degrees: float = 10.0,
+        perspective: float = 0.08,
+        brightness: float = 0.15,
+        contrast: float = 0.15,
+        blur: float = 0.1,
+    ):
+        """Initialize prompt canvas geometry and training-only augmentation strengths."""
+        self.shape = tuple(map(int, shape))
+        self.sizes = tuple(map(int, sizes))
+        self.size_jitter = float(size_jitter)
+        self.degrees = float(degrees)
+        self.perspective = float(perspective)
+        self.brightness = float(brightness)
+        self.contrast = float(contrast)
+        self.blur = float(blur)
+        max_size = round(max(self.sizes, default=0) * (1 + self.size_jitter))
+        if not self.sizes or min(self.sizes) <= 0 or max_size > min(self.shape):
+            raise ValueError(f"Prompt sizes {self.sizes} must be within canvas shape {self.shape}")
+
+    def __call__(
+        self, image: np.ndarray, augment: bool = False, rng: random.Random | Any = random
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return a neutral canvas and one xyxy ROI for each prompt copy."""
+        if image is None or not image.size:
+            raise ValueError("Visual prompt crop must be a non-empty image")
+        height, width = self.shape
+        canvas = np.full((height, width, image.shape[2]), 114, dtype=image.dtype)
+        boxes = []
+        for index, base_size in enumerate(self.sizes):
+            size = base_size
+            if augment and self.size_jitter:
+                size = round(base_size * rng.uniform(1 - self.size_jitter, 1 + self.size_jitter))
+                size = min(max(size, min(self.sizes)), round(max(self.sizes) * (1 + self.size_jitter)))
+            tile, mask = self._make_tile(image, augment, rng)
+            tile = cv2.resize(tile, (size, size), interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
+            cx, cy = round((index + 1) * width / (len(self.sizes) + 1)), height // 2
+            x1, y1 = cx - size // 2, cy - size // 2
+            x2, y2 = x1 + size, y1 + size
+            canvas[y1:y2, x1:x2] = tile
+            ys, xs = np.where(mask > 0)
+            if len(xs):
+                boxes.append([x1 + xs.min(), y1 + ys.min(), x1 + xs.max() + 1, y1 + ys.max() + 1])
+        if not boxes:
+            raise ValueError("Visual prompt augmentation removed the complete prompt")
+        return canvas, np.asarray(boxes, dtype=np.float32)
+
+    def _make_tile(self, image: np.ndarray, augment: bool, rng: random.Random | Any) -> tuple[np.ndarray, np.ndarray]:
+        """Create one square prompt tile and its transformed occupancy mask."""
+        view = image.copy()
+        if augment:
+            alpha = rng.uniform(1 - self.contrast, 1 + self.contrast)
+            beta = rng.uniform(-self.brightness, self.brightness) * 255
+            view = np.clip(view.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+            if rng.random() < self.blur:
+                view = cv2.GaussianBlur(view, (3, 3), 0)
+        side = max(view.shape[:2])
+        tile = np.full((side, side, view.shape[2]), 114, dtype=view.dtype)
+        mask = np.zeros((side, side), dtype=np.uint8)
+        left, top = (side - view.shape[1]) // 2, (side - view.shape[0]) // 2
+        tile[top : top + view.shape[0], left : left + view.shape[1]] = view
+        mask[top : top + view.shape[0], left : left + view.shape[1]] = 1
+        if augment and (self.degrees or self.perspective):
+            rotation = np.eye(3, dtype=np.float32)
+            rotation[:2] = cv2.getRotationMatrix2D((side / 2, side / 2), rng.uniform(-self.degrees, self.degrees), 1)
+            corners = np.array([[0, 0], [side - 1, 0], [side - 1, side - 1], [0, side - 1]], np.float32)
+            offset = np.array(
+                [[rng.uniform(-self.perspective, self.perspective) * side for _ in range(2)] for _ in range(4)],
+                dtype=np.float32,
+            )
+            matrix = cv2.getPerspectiveTransform(corners, corners + offset) @ rotation
+            tile = cv2.warpPerspective(tile, matrix, (side, side), borderValue=(114, 114, 114))
+            mask = cv2.warpPerspective(mask, matrix, (side, side), flags=cv2.INTER_NEAREST)
+        return tile, mask
 
 
 class RandomLoadText(BaseTransform):

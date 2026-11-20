@@ -1352,6 +1352,7 @@ class TVPDetectLoss:
         self.ori_nc = self.vp_criterion.nc
         self.ori_no = self.vp_criterion.no
         self.ori_reg_max = self.vp_criterion.reg_max
+        self.full_loss = getattr(model, "visual_prompt_full_loss", False)
 
     def parse_output(self, preds) -> dict[str, torch.Tensor]:
         """Parse model predictions to extract features."""
@@ -1365,13 +1366,9 @@ class TVPDetectLoss:
         self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Calculate the loss for text-visual prompt detection."""
-        if self.ori_nc == preds["scores"].shape[1]:
-            loss = torch.zeros(3, device=self.vp_criterion.device, requires_grad=True)
-            return loss, dict(zip(self.loss_names, loss.detach()))
-
         preds["scores"] = self._get_vp_features(preds)
         vp_loss = self.vp_criterion(preds, batch)
-        return vp_loss[0][1], dict(zip(self.loss_names, vp_loss[1].values()))
+        return (vp_loss[0] if self.full_loss else vp_loss[0][1]), dict(zip(self.loss_names, vp_loss[1].values()))
 
     def _get_vp_features(self, preds: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         """Extract visual-prompt features from the model output."""

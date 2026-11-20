@@ -16,7 +16,7 @@ from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.torch_utils import unwrap_model
 
 from ..world.train_world import WorldTrainerFromScratch
-from .val import YOLOEDetectValidator, YOLOESegValidator
+from .val import YOLOEDetectValidator, YOLOEPairedValidator, YOLOESegValidator
 
 
 class YOLOETrainer(DetectionTrainer):
@@ -275,3 +275,69 @@ class YOLOEVPTrainer(YOLOETrainerFromScratch):
                 d.transforms.append(LoadVisualPrompt())
         else:
             self.train_loader.dataset.transforms.append(LoadVisualPrompt())
+
+
+class YOLOEPairedVPTrainer(YOLOETrainer):
+    """Fine-tune a detection-only YOLOE model from a separate cropped visual prompt for each target image."""
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict | None = None, _callbacks: dict | None = None):
+        """Initialize paired training with target augmentations that preserve realistic panel layouts."""
+        overrides = {} if overrides is None else overrides
+        overrides.setdefault("mosaic", 0.0)
+        overrides.setdefault("mixup", 0.0)
+        overrides.setdefault("cutmix", 0.0)
+        overrides.setdefault("fliplr", 0.0)
+        overrides.setdefault("flipud", 0.0)
+        super().__init__(cfg, overrides, _callbacks)
+        if self.args.task != "detect":
+            raise ValueError("YOLOEPairedVPTrainer supports detection models only")
+
+    def get_model(self, cfg=None, weights=None, verbose: bool = True):
+        """Build the 80-prompt YOLOE architecture so official and staged weights load without shape loss."""
+        model = YOLOEModel(
+            cfg["yaml_file"] if isinstance(cfg, dict) else cfg,
+            ch=self.data["channels"],
+            nc=80,
+            verbose=verbose and RANK == -1,
+        )
+        if weights:
+            model.load(weights)
+        return model
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build a query-conditioned dataset with independent reference and target images."""
+        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
+        return build_yolo_dataset(
+            self.args,
+            img_path,
+            batch,
+            self.data,
+            mode=mode,
+            rect=False,
+            stride=gs,
+            paired_visual_prompt=True,
+        )
+
+    def preprocess_batch(self, batch: dict) -> dict:
+        """Move both branches to the training device and normalize the reference image."""
+        batch = super().preprocess_batch(batch)
+        batch["refer_img"] = batch["refer_img"].float() / 255
+        return batch
+
+    def set_model_attributes(self):
+        """Configure whether paired training optimizes classification only or the full detection loss."""
+        super().set_model_attributes()
+        full_loss = self.args.visual_prompt_full_loss
+        self.model.visual_prompt_full_loss = full_loss
+        if not full_loss and self.args.freeze is None:
+            head_idx = len(self.model.model) - 1
+            head = self.model.model[head_idx]
+            frozen_head = (f"{head_idx}.{name}" for name, _ in head.named_children() if name != "savpe")
+            self.args.freeze = [*range(head_idx), *frozen_head]
+            LOGGER.info("Paired visual-prompt stage 1: freezing all model parameters except 'savpe'.")
+
+    def get_validator(self):
+        """Return a validator that encodes each batch's independent reference images."""
+        return YOLOEPairedValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )

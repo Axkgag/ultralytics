@@ -24,6 +24,7 @@ from ultralytics.data.dataset import (
     PolygonSemanticDataset,
     SemanticDataset,
     YOLODataset,
+    YOLOEPairedDataset,
     YOLOMultiModalDataset,
 )
 from ultralytics.data.loaders import (
@@ -243,6 +244,9 @@ def build_yolo_dataset(
     rect: bool = False,
     stride: int = 32,
     multi_modal: bool = False,
+    paired_visual_prompt: bool = False,
+    all_visual_prompts: bool = False,
+    visual_prompt_queries: list[tuple[int, int]] | None = None,
     fraction: float | None = None,
 ) -> Dataset:
     """Build and return a YOLO dataset based on configuration parameters."""
@@ -258,6 +262,8 @@ def build_yolo_dataset(
         else:
             dataset = PolygonSemanticDataset
         pad = 0.0  # no pad for semantic
+    elif paired_visual_prompt:
+        dataset = YOLOEPairedDataset
     elif multi_modal:
         dataset = YOLOMultiModalDataset
     else:
@@ -267,6 +273,9 @@ def build_yolo_dataset(
         fraction = 1.0  # already limited during dataset download
     elif fraction is None:
         fraction = get_split_fraction(cfg.fraction, mode)
+    paired_args = (
+        {"all_queries": all_visual_prompts, "query_ids": visual_prompt_queries} if paired_visual_prompt else {}
+    )
     return dataset(
         img_path=img_path,
         imgsz=cfg.imgsz,
@@ -283,6 +292,7 @@ def build_yolo_dataset(
         classes=cfg.classes,
         data=data,
         fraction=fraction,
+        **paired_args,
     )
 
 

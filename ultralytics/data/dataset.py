@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -18,15 +19,19 @@ from torch.utils.data import ConcatDataset
 from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
+from ultralytics.utils.patches import imread
 from ultralytics.utils.torch_utils import TORCHVISION_0_18
 
 from .augment import (
     Compose,
     DepthFormat,
+    ElevatorFormat,
     Format,
     LetterBox,
+    LoadVisualPrompt,
     RandomLoadText,
     SemanticFormat,
+    VisualPromptCanvas,
     classify_augmentations,
     classify_transforms,
     v8_transforms,
@@ -421,7 +426,7 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats", "semantic_mask", "sem_masks", "depth"}:
+            if k in {"img", "refer_img", "text_feats", "semantic_mask", "sem_masks", "depth", "query_idx"}:
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
@@ -434,6 +439,189 @@ class YOLODataset(BaseDataset):
                 new_batch["batch_idx"][i] += i  # add target image index for build_targets()
             new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
+
+
+class ElevatorDataset(YOLODataset):
+    """Dataset for nine-column elevator button labels with floor and light attributes."""
+
+    format_class = ElevatorFormat
+
+    def get_cache_hash(self) -> str:
+        """Return a format-specific cache hash to avoid loading standard five-column labels."""
+        return get_hash(self.label_files + self.im_files + ["elevator-labels-v1"])
+
+    def verify_args(self) -> tuple:
+        """Return image-label verification arguments for the nine-column elevator format."""
+        return verify_image_label, zip(
+            self.im_files,
+            self.label_files,
+            repeat(self.prefix),
+            repeat(False),
+            repeat(len(self.data["names"])),
+            repeat(0),
+            repeat(0),
+            repeat(self.single_cls),
+            repeat(True),
+        )
+
+    def result_to_label(self, result: list) -> tuple[dict | None, int, int, int, int, str]:
+        """Convert a verified elevator row into the representation used by augmentations."""
+        im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg = result
+        label = (
+            {
+                "im_file": im_file,
+                "shape": shape,
+                "cls": lb[:, 0:1],
+                "elevator": lb[:, 5:9],
+                "bboxes": lb[:, 1:5],
+                "segments": segments,
+                "keypoints": keypoint,
+                "normalized": True,
+                "bbox_format": "xywh",
+            }
+            if im_file
+            else None
+        )
+        return label, nm_f, nf_f, ne_f, nc_f, msg
+
+    def update_labels(self, include_class: list[int] | None) -> None:
+        """Filter detection classes and their aligned elevator attributes."""
+        include_class_array = np.array(include_class).reshape(1, -1)
+        for label in self.labels:
+            if include_class is not None:
+                selected = (label["cls"] == include_class_array).any(1)
+                label["cls"] = label["cls"][selected]
+                label["elevator"] = label["elevator"][selected]
+                label["bboxes"] = label["bboxes"][selected]
+                if label["segments"]:
+                    label["segments"] = [segment for segment, keep in zip(label["segments"], selected) if keep]
+                if label.get("keypoints") is not None:
+                    label["keypoints"] = label["keypoints"][selected]
+            if self.single_cls:
+                label["cls"][:] = 0
+
+    def update_labels_info(self, label: dict) -> dict:
+        """Combine attributes with classes while instance augmentations need aligned row operations."""
+        label["cls"] = np.concatenate((label["cls"], label.pop("elevator")), axis=1)
+        return super().update_labels_info(label)
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Collate images, boxes, and aligned elevator attributes into one batch."""
+        new_batch = YOLODataset.collate_fn(batch)
+        new_batch["elevator"] = torch.cat(new_batch["elevator"], 0)
+        return new_batch
+
+
+class YOLOEPairedDataset(ElevatorDataset):
+    """Pair each target image with one floor-identity visual prompt from nine-column labels."""
+
+    def __init__(self, *args, all_queries: bool = False, query_ids: list[tuple[int, int]] | None = None, **kwargs):
+        """Initialize the dataset and index floor instances by their slot1/slot2 identity."""
+        super().__init__(*args, **kwargs)
+        self.all_queries = all_queries
+        cfg = self.data.get("visual_prompt", {})
+        self.same_image = float(cfg.get("same_image", 0.2))
+        self.negative = float(cfg.get("negative", 0.1))
+        self.prompt_padding = float(cfg.get("padding", 0.1))
+        self.prompt_canvas = VisualPromptCanvas(
+            (self.imgsz, self.imgsz),
+            sizes=tuple(cfg.get("sizes", (64, 96, 160))),
+            size_jitter=cfg.get("size_jitter", 0.2),
+            degrees=cfg.get("degrees", 10.0),
+            perspective=cfg.get("perspective", 0.08),
+            brightness=cfg.get("brightness", 0.15),
+            contrast=cfg.get("contrast", 0.15),
+            blur=cfg.get("blur", 0.1),
+        )
+        if not 0.0 <= self.same_image <= 1.0 or not 0.0 <= self.negative <= 1.0:
+            raise ValueError("visual_prompt same_image and negative probabilities must be in [0, 1]")
+        self.prompt_instances = defaultdict(list)
+        for image_idx, label in enumerate(self.labels):
+            for instance_idx, (cls, attrs) in enumerate(zip(label["cls"].reshape(-1), label["elevator"])):
+                if int(cls) == 0:
+                    query_id = tuple(attrs[:2].astype(int).tolist())
+                    self.prompt_instances[query_id].append((image_idx, instance_idx))
+        if not self.prompt_instances:
+            raise ValueError("Paired visual-prompt training requires at least one labeled floor button")
+        self.query_ids = list(query_ids) if query_ids is not None else sorted(self.prompt_instances)
+        if self.all_queries and self.augment:
+            raise ValueError("All-query visual-prompt episodes are only supported for validation")
+
+    def __len__(self) -> int:
+        """Return target count or the target-query Cartesian product for exhaustive validation."""
+        size = super().__len__()
+        return size * len(self.query_ids) if self.all_queries else size
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return one query-conditioned detection episode with target classes remapped to prompt slot zero."""
+        if self.all_queries:
+            index, query_idx = divmod(index, len(self.query_ids))
+        labels = super().__getitem__(index)
+        rng = random if self.augment else random.Random(index)
+        cls = labels["cls"].view(-1).to(torch.int64)
+        slots = labels["elevator"][:, :2].to(torch.int64)
+        present = {tuple(x.tolist()) for x in slots[cls == 0]}
+        if self.all_queries:
+            query_id = self.query_ids[query_idx]
+        else:
+            absent = [query_id for query_id in self.prompt_instances if query_id not in present]
+            positive = bool(present) and (not absent or rng.random() >= self.negative)
+            query_id = rng.choice(sorted(present) if positive else absent)
+            query_idx = self.query_ids.index(query_id)
+        query_slots = slots.new_tensor(query_id)
+        keep = (cls == 0) & (slots == query_slots).all(1)
+
+        if not self.all_queries:
+            if positive and rng.random() < self.same_image:
+                prompt_idx = rng.choice(torch.where(keep)[0].tolist())
+                image = labels["img"].permute(1, 2, 0).numpy()[..., ::-1].copy()
+                crop = self._crop_prompt(image, labels["bboxes"][prompt_idx].tolist())
+                refer_img, visuals = self._format_prompt(crop, rng)
+            else:
+                candidates = [x for x in self.prompt_instances[query_id] if x[0] != index]
+                refer_img, visuals = self._load_prompt(rng.choice(candidates or self.prompt_instances[query_id]), rng)
+
+        for key in ("bboxes", "batch_idx", "elevator"):
+            labels[key] = labels[key][keep]
+        labels["cls"] = torch.zeros((int(keep.sum()), 1), dtype=labels["cls"].dtype)
+        labels["query_idx"] = torch.tensor(query_idx, dtype=torch.int64)
+        if not self.all_queries:
+            labels["refer_img"] = refer_img
+            labels["visuals"] = visuals
+        return labels
+
+    def _load_prompt(self, instance: tuple[int, int], rng: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Crop one raw annotated instance and place augmented copies on the prompt canvas."""
+        image_idx, instance_idx = instance
+        image = imread(self.im_files[image_idx], flags=self.cv2_flag)
+        if image is None:
+            raise FileNotFoundError(f"Image Not Found {self.im_files[image_idx]}")
+        crop = self._crop_prompt(image, self.labels[image_idx]["bboxes"][instance_idx])
+        return self._format_prompt(crop, rng)
+
+    def _crop_prompt(self, image: np.ndarray, bbox: np.ndarray | list[float]) -> np.ndarray:
+        """Crop one normalized xywh prompt box with the configured context padding."""
+        h, w = image.shape[:2]
+        xc, yc, bw, bh = bbox
+        pad_w, pad_h = bw * self.prompt_padding, bh * self.prompt_padding
+        x1 = max(int((xc - bw / 2 - pad_w) * w), 0)
+        y1 = max(int((yc - bh / 2 - pad_h) * h), 0)
+        x2 = min(int(np.ceil((xc + bw / 2 + pad_w) * w)), w)
+        y2 = min(int(np.ceil((yc + bh / 2 + pad_h) * h)), h)
+        crop = image[y1:y2, x1:x2]
+        if not crop.size:
+            raise ValueError(f"Empty prompt crop for normalized box {bbox}")
+        return crop
+
+    def _format_prompt(self, crop: np.ndarray, rng: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the shared multi-scale reference representation for training or validation."""
+        canvas, boxes = self.prompt_canvas(crop, augment=self.augment, rng=rng)
+        refer_img = Format()._format_img(canvas)
+        visuals = LoadVisualPrompt().get_visuals(
+            np.zeros(len(boxes), dtype=np.int64), (self.imgsz, self.imgsz), bboxes=boxes
+        )
+        return refer_img, visuals
 
 
 class DepthDataset(YOLODataset):

@@ -1412,7 +1412,6 @@ class YOLOEModel(DetectionModel):
                 vpe = m.get_vpe(x, vpe) if vpe is not None else None
                 if return_vpe:
                     assert vpe is not None
-                    assert not self.training
                     return vpe
                 cls_pe = self.get_cls_pe(m.get_tpe(tpe), vpe).to(device=x[0].device, dtype=x[0].dtype)
                 if cls_pe.shape[0] != b or m.export:
@@ -1444,10 +1443,13 @@ class YOLOEModel(DetectionModel):
                 else self.init_criterion()
             )
         if preds is None:
+            vpe = batch.get("visuals", None)
+            if "refer_img" in batch:
+                vpe = self.predict(batch["refer_img"], vpe=vpe, return_vpe=True)
             preds = self.forward(
                 batch["img"],
                 tpe=None if "visuals" in batch else batch.get("txt_feats", None),
-                vpe=batch.get("visuals", None),
+                vpe=vpe,
             )
         return self.criterion(preds, batch)
 

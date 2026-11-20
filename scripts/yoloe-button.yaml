@@ -1,0 +1,28 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+path: /mnt/yihao/codes/buttonDet/datasets
+train:
+  - button/qwen_qwenreview_yolo_mini/images/train
+  - 0920/qwen_review_yolo/images/train
+val:
+  - 0909_0911/qwen_review_yolo/images/train
+  - 0920/qwen_review_yolo/images/val
+test:
+  - u2v1_0929_1020/yolo/images/train
+
+elevator: true
+names:
+  0: floor
+  1: other
+
+visual_prompt:
+  same_image: 0.2
+  negative: 0.1
+  padding: 0.0
+  sizes: [64, 96, 160]
+  size_jitter: 0.2
+  degrees: 10.0
+  perspective: 0.08
+  brightness: 0.15
+  contrast: 0.15
+  blur: 0.1

@@ -37,6 +37,12 @@ amp: True # (bool | str) train precision: True/'fp16' (AMP check), 'bf16', or Fa
 fraction: 1.0 # (float | int | list) train ratio/count or split values; 1 = all, integer >1 = count, test 0 = none
 profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int), or specific layer indices or module names like "23.cv2" (list)
+visual_prompt_full_loss: False # (bool) paired YOLOE: train the full detector instead of only the visual prompt encoder
+visual_prompt_bank: "" # (str) paired YOLOE: fixed prompt-bank YAML for exhaustive validation
+visual_prompt_fail_cases: False # (bool) paired YOLOE: save categorized exhaustive-validation failures
+visual_prompt_fail_conf: 0.25 # (float) paired YOLOE: confidence threshold for fail-case rendering
+visual_prompt_fail_iou: 0.5 # (float) paired YOLOE: IoU threshold for fail-case matching
+visual_prompt_fail_max: 200 # (int) paired YOLOE: maximum rendered failures per category
 multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are rounded to stride multiples
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
 channels_last: # (bool, optional) auto-enable for CUDA training on PyTorch 1.11+ and supported x86 CPU inference
